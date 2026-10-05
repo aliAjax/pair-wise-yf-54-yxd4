@@ -5,7 +5,7 @@ import { toTypedSchema } from '@vee-validate/zod';
 import { useForm } from 'vee-validate';
 import { z } from 'zod';
 import { api } from './services/api';
-import { useExhibitionStore, type Exhibit } from './stores/exhibition';
+import { useExhibitionStore, readingOutOfBounds, VersionConflictError, type CheckStatus, type Exhibit } from './stores/exhibition';
 
 const store = useExhibitionStore();
 const online = useOnline();
@@ -22,6 +22,68 @@ const apiLabel = computed(() => String(api.defaults.baseURL));
 
 const submit = handleSubmit((values) => { store.addExhibit(values); dialog.value = false; resetForm(); });
 function stageLabel(stage: Exhibit['stage']) { return { arrival: '到场点交', install: '布展核验', return: '闭展归还' }[stage]; }
+
+const statusMeta: Record<CheckStatus, { label: string; color: string }> = {
+  pending: { label: '待核验', color: 'grey' },
+  passed: { label: '通过', color: 'green' },
+  issue: { label: '异常', color: 'red' },
+  review: { label: '待复核', color: 'orange' }
+};
+
+// ---- 读数提交对话框 ----
+const readingDialog = ref(false);
+const readingTarget = ref<Exhibit | null>(null);
+const baseVersion = ref(0);
+const conflict = ref('');
+const readingForm = ref({ temperature: 22, humidity: 55, light: 180, collectedAt: '' });
+
+function toLocalInput(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function openReading(item: Exhibit) {
+  readingTarget.value = item;
+  baseVersion.value = item.version;
+  conflict.value = '';
+  readingForm.value = {
+    temperature: item.environment.temperature,
+    humidity: item.environment.humidity,
+    light: item.environment.light,
+    collectedAt: toLocalInput(new Date())
+  };
+  readingDialog.value = true;
+}
+
+function submitReading() {
+  if (!readingTarget.value) return;
+  const collectedAt = readingForm.value.collectedAt ? new Date(readingForm.value.collectedAt).getTime() : Date.now();
+  try {
+    store.submitReading(
+      readingTarget.value.id,
+      { temperature: Number(readingForm.value.temperature), humidity: Number(readingForm.value.humidity), light: Number(readingForm.value.light), collectedAt },
+      baseVersion.value
+    );
+    conflict.value = '';
+    baseVersion.value = readingTarget.value.version;
+  } catch (error) {
+    if (error instanceof VersionConflictError) conflict.value = error.message;
+    else throw error;
+  }
+}
+
+/** 模拟另一终端抢先提交同一展柜读数：当前版本号 +1，本终端基线过期 */
+function simulateOtherTerminal() {
+  if (!readingTarget.value) return;
+  const item = readingTarget.value;
+  store.submitReading(
+    item.id,
+    { temperature: item.environment.temperature, humidity: item.environment.humidity, light: item.environment.light, collectedAt: Date.now() },
+    item.version
+  );
+}
+
+function formatTime(ts: number) { return new Date(ts).toLocaleString('zh-CN'); }
 </script>
 
 <template>
@@ -58,7 +120,7 @@ function stageLabel(stage: Exhibit['stage']) { return { arrival: '到场点交',
                     <v-list-item-title>{{ item.name }} · {{ item.code }}</v-list-item-title>
                     <v-list-item-subtitle>{{ item.lender }} · {{ item.hall }} · {{ stageLabel(item.stage) }}</v-list-item-subtitle>
                     <template #append>
-                      <v-chip size="small" :color="item.status === 'issue' ? 'red' : item.status === 'passed' ? 'green' : 'grey'">{{ item.status }}</v-chip>
+                      <v-chip size="small" :color="statusMeta[item.status].color">{{ statusMeta[item.status].label }}</v-chip>
                     </template>
                   </v-list-item>
                 </template>
@@ -66,9 +128,23 @@ function stageLabel(stage: Exhibit['stage']) { return { arrival: '到场点交',
             </v-window-item>
             <v-window-item value="environment">
               <v-table>
-                <thead><tr><th>展品</th><th>温度</th><th>湿度</th><th>照度</th><th>条件</th></tr></thead>
-                <tbody><tr v-for="item in store.exhibits" :key="item.id"><td>{{ item.code }}</td><td>{{ item.environment.temperature }}℃</td><td>{{ item.environment.humidity }}%</td><td>{{ item.environment.light }} lux</td><td><v-btn size="small" color="green" variant="text" @click="store.setCondition(item.id, 'passed')">通过</v-btn><v-btn size="small" color="red" variant="text" @click="store.setCondition(item.id, 'issue')">异常</v-btn></td></tr></tbody>
+                <thead><tr><th>展品</th><th>温度</th><th>湿度</th><th>照度</th><th>版本</th><th>条件</th><th>操作</th></tr></thead>
+                <tbody><tr v-for="item in store.exhibits" :key="item.id">
+                  <td>{{ item.code }}</td>
+                  <td>{{ item.environment.temperature }}℃</td>
+                  <td>{{ item.environment.humidity }}%</td>
+                  <td>{{ item.environment.light }} lux</td>
+                  <td class="text-caption">v{{ item.version }}</td>
+                  <td><v-chip size="small" :color="statusMeta[item.status].color">{{ statusMeta[item.status].label }}</v-chip></td>
+                  <td>
+                    <v-btn size="small" color="deep-purple" variant="text" @click="openReading(item)">记录读数</v-btn>
+                    <v-btn v-if="item.status === 'review'" size="small" color="orange" variant="text" @click="store.reviewRecovery(item.id)">保管员复核</v-btn>
+                  </td>
+                </tr></tbody>
               </v-table>
+              <div class="pa-4 text-caption text-medium-emphasis">
+                判定规则：同一展柜连续 3 次越界才置异常，单点抖动只记一笔；恢复需连续 2 次正常并经保管员复核。阈值：温度 18–24℃、湿度 45–65%、照度 ≤300 lux。
+              </div>
             </v-window-item>
             <v-window-item value="discrepancy">
               <v-list><v-list-item v-for="item in store.discrepancies" :key="item.id"><v-list-item-title>{{ item.title }}</v-list-item-title><v-list-item-subtitle>展品 {{ item.exhibitId }} · {{ item.severity === 'major' ? '重大差异' : '轻微差异' }}</v-list-item-subtitle><template #append><v-btn :disabled="item.resolved" color="green" @click="store.resolveDiscrepancy(item.id)">{{ item.resolved ? '已解决' : '确认解决' }}</v-btn></template></v-list-item></v-list>
@@ -79,6 +155,32 @@ function stageLabel(stage: Exhibit['stage']) { return { arrival: '到场点交',
         <v-dialog v-model="dialog" max-width="560">
           <v-card title="登记新展品">
             <v-card-text><v-form @submit.prevent="submit"><v-text-field v-model="code" label="展品编号" :error-messages="errors.code" /><v-text-field v-model="name" label="展品名称" :error-messages="errors.name" /><v-text-field v-model="lender" label="借展方" :error-messages="errors.lender" /><v-text-field v-model="hall" label="展厅/柜位" :error-messages="errors.hall" /><v-btn type="submit" color="deep-purple" block>写入点交队列</v-btn></v-form></v-card-text>
+          </v-card>
+        </v-dialog>
+
+        <v-dialog v-model="readingDialog" max-width="640">
+          <v-card v-if="readingTarget" :title="`记录读数 · ${readingTarget.code}`">
+            <v-card-text>
+              <v-alert v-if="conflict" type="error" icon="mdi-alert-circle" class="mb-3">{{ conflict }}</v-alert>
+              <v-row>
+                <v-col cols="3"><v-text-field v-model.number="readingForm.temperature" label="温度 ℃" type="number" /></v-col>
+                <v-col cols="3"><v-text-field v-model.number="readingForm.humidity" label="湿度 %" type="number" /></v-col>
+                <v-col cols="3"><v-text-field v-model.number="readingForm.light" label="照度 lux" type="number" /></v-col>
+                <v-col cols="3"><v-text-field v-model="readingForm.collectedAt" label="采集时刻" type="datetime-local" /></v-col>
+              </v-row>
+              <div class="d-flex align-center ga-2">
+                <v-btn color="deep-purple" @click="submitReading">提交读数（基于 v{{ baseVersion }}）</v-btn>
+                <v-btn variant="text" color="secondary" @click="simulateOtherTerminal">模拟另一终端提交</v-btn>
+              </div>
+              <div class="text-caption text-medium-emphasis mt-2">同一展柜连续 3 次越界判异常；单点抖动只记一笔；恢复需连续 2 次正常并经保管员复核。</div>
+              <v-list density="compact" class="mt-3">
+                <v-list-item v-for="r in store.readingsByExhibit(readingTarget.id)" :key="r.id">
+                  <template #prepend><v-icon :color="readingOutOfBounds(r) ? 'red' : 'green'">{{ readingOutOfBounds(r) ? 'mdi-alert-circle' : 'mdi-check-circle' }}</v-icon></template>
+                  <v-list-item-title>{{ formatTime(r.collectedAt) }} · {{ r.temperature }}℃ / {{ r.humidity }}% / {{ r.light }} lux</v-list-item-title>
+                  <v-list-item-subtitle>{{ readingOutOfBounds(r) ? '越界' : '正常' }}</v-list-item-subtitle>
+                </v-list-item>
+              </v-list>
+            </v-card-text>
           </v-card>
         </v-dialog>
 
